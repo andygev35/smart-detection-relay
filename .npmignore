@@ -1,0 +1,11 @@
+# Internal dev notes - not for public distribution (bug history, personal
+# location/camera layout details, workflow notes)
+PROJECT-CONTEXT.md
+
+# Editor / OS cruft
+.vscode/
+.DS_Store
+
+# Build artifacts and local config not needed in the published package
+*.log
+.npmrc

@@ -1,0 +1,8 @@
+node_modules/
+dist/
+PROJECT-CONTEXT.md
+*.log
+.DS_Store
+.npmrc
+.vscode/
+out/
