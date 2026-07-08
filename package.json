@@ -1,7 +1,15 @@
 {
    "name": "@andygev35/smart-detection-relay",
-   "version": "0.2.8",
+   "version": "0.2.9",
    "license": "MIT",
+   "repository": {
+      "type": "git",
+      "url": "git+https://github.com/andygev35/smart-detection-relay.git"
+   },
+   "bugs": {
+      "url": "https://github.com/andygev35/smart-detection-relay/issues"
+   },
+   "homepage": "https://github.com/andygev35/smart-detection-relay#readme",
    "publishConfig": {
       "access": "public"
    },

@@ -2,6 +2,10 @@
 
 Routes Scrypted NVR's object-detection events to **Android TV overlays** and **phone push notifications** — with cropped thumbnails, snooze buttons, and tap-to-timeline deep links. No Home Assistant required; notifications are delivered entirely through the Scrypted SDK, and the plugin stores no third-party credentials of any kind.
 
+[![npm version](https://img.shields.io/npm/v/@andygev35/smart-detection-relay.svg)](https://www.npmjs.com/package/@andygev35/smart-detection-relay)
+
+**Source & issues:** [github.com/andygev35/smart-detection-relay](https://github.com/andygev35/smart-detection-relay) — found a bug or have a feature request? [Open an issue](https://github.com/andygev35/smart-detection-relay/issues/new).
+
 ## Requirements
 
 - **A Scrypted NVR license/subscription active on your Scrypted server.** This plugin relies entirely on Scrypted NVR's own object detection (bounding boxes, classes, scores) — it does not run its own detection model.
@@ -40,3 +44,9 @@ Routes Scrypted NVR's object-detection events to **Android TV overlays** and **p
 - If you rename a `Notifier` device in Scrypted, you'll need to reselect it under **Notify Services** — the dropdown is keyed on the device's display name for readability.
 - Plugin restarts reset in-memory debounce and snooze state.
 - **Snooze duration configuration only applies on Android.** The Scrypted iOS app doesn't render this plugin's custom snooze buttons at all - it substitutes its own fixed, built-in snooze action instead. Snoozing still works on iOS, but at whatever duration the Scrypted app itself hardcodes, not the `Snooze Durations` setting.
+
+## Issues & Contributing
+
+Found a bug, have a feature request, or hit unexpected behavior? Please [open an issue on GitHub](https://github.com/andygev35/smart-detection-relay/issues/new) rather than leaving an npm review — it's much easier to track and follow up on there. Include your Scrypted server version, camera/device type, and any relevant log output if you can.
+
+The full source is available at [github.com/andygev35/smart-detection-relay](https://github.com/andygev35/smart-detection-relay). Pull requests are welcome, but please open an issue first to discuss any non-trivial change before putting in the work.
