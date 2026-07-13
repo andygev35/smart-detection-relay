@@ -10,7 +10,7 @@ const NUM_RULE_SLOTS = 8;
 // custom class names (e.g. specific animal subtypes) not in this preset list.
 const DETECTION_CLASS_CHOICES = ['person', 'vehicle', 'animal', 'package', 'face', 'plate'];
 // All the per-rule storage key suffixes - used to bulk-clear a rule slot on removal.
-const RULE_FIELD_SUFFIXES = ['Name', 'ClassName', 'Zone', 'ScoreThreshold', 'Critical', 'FixedCrop', 'MinWidth', 'MinHeight', 'MaxX', 'MaxY'];
+const RULE_FIELD_SUFFIXES = ['Name', 'ClassName', 'Zone', 'ScoreThreshold', 'Critical', 'FixedCrop', 'MinWidth', 'MinHeight', 'MaxX', 'MaxY', 'HaCategory', 'HaIcon'];
 const GET_DETECTION_INPUT_RETRIES = [0, 300, 700, 1200, 2000];
 const MIN_PLAUSIBLE_IMAGE_BYTES = 5000;
 // Scrypted's Home Assistant plugin still syncs its own Notifier-interface devices
@@ -32,6 +32,8 @@ interface ClassZoneRule {
     maxY?: number;       // skip detections whose bounding box starts beyond this y coordinate
     fixedCrop?: [number, number, number, number]; // [x, y, width, height] fixed crop bypassing bounding box
     critical?: boolean;  // send as a critical push notification (louder/bypassing-DND alert sound) instead of normal
+    haCategory?: string; // HA notification channel/category name (only used if an HA notifier is configured)
+    haIcon?: string;     // HA notification status bar MDI icon, e.g. "mdi:cctv" (only used if an HA notifier is configured)
 }
 
 interface CameraRelayConfig {
@@ -116,7 +118,16 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
     cachedLocalAddresses: string[] | undefined;
     cachedActionUrl: string | undefined;
     // key: `${cameraId}-${className}`, value: best detection seen so far during window
-    pendingDetections: Map<string, { detection: any, eventData: any, eventDetails: EventDetails, camera: any, config: CameraRelayConfig, fixedCrop?: [number, number, number, number], critical?: boolean, timer: NodeJS.Timeout }> = new Map();
+    pendingDetections: Map<string, { detection: any, eventData: any, eventDetails: EventDetails, camera: any, config: CameraRelayConfig, fixedCrop?: [number, number, number, number], critical?: boolean, haCategory?: string, haIcon?: string, timer: NodeJS.Timeout }> = new Map();
+
+    // Direct WebSocket connection to Home Assistant's event bus, used solely to
+    // react to HA notification action taps (snooze buttons) the instant they
+    // happen - no HA automation authoring, no MQTT broker required. See
+    // startHomeAssistantEventListener() below.
+    haWs: any | undefined;
+    haWsReconnectTimer: NodeJS.Timeout | undefined;
+    haWsPingTimer: NodeJS.Timeout | undefined;
+    haWsMessageId: number = 1;
 
     settingsStorage = new StorageSettings(this, {
         // ---- Global: General ----
@@ -127,34 +138,135 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
             value: true,
             immediate: true,
         },
+        // ---- TV Overlay tab ----
         tvOverlayEnabled: {
             title: 'TV Overlay Enabled',
             description: 'Send detection snapshots to the TV Overlay hosts below. Turn off if you are not using the Android TV overlay app - phone push notifications are unaffected either way.',
             type: 'boolean',
             value: true,
             immediate: true,
+            group: 'TV Overlay',
         },
-        // ---- Global: Notifications ----
-        notifyServices: {
-            title: 'Notify Services',
-            description: 'Select one or more Scrypted Notifier-interface devices to deliver phone push notifications to (e.g. the native Scrypted NVR user-device for your phone).',
-            type: 'string',
-            value: '',
-            multiple: true,
-            onGet: async () => ({ choices: this.getScryptedNotifierChoices() }),
-        },
-        // ---- Global: TV Overlay ----
         tvHosts: {
             title: 'TV Overlay Hosts',
             description: 'Comma-separated list of TvOverlay base URLs (e.g. http://192.168.3.135:5001, http://192.168.3.181:5001)',
             type: 'string',
             value: 'http://192.168.3.135:5001, http://192.168.3.181:5001',
+            group: 'TV Overlay',
         },
         notificationDurationSeconds: {
             title: 'Notification Duration (seconds)',
             description: 'How long TV overlay notifications are displayed.',
             type: 'number',
             value: 10,
+            group: 'TV Overlay',
+        },
+        // ---- Notifiers tab (subgroups: Scrypted / Home Assistant / ntfy / Gotify) ----
+        notifyServices: {
+            title: 'Notify Services',
+            description: 'Select one or more Scrypted Notifier-interface devices to deliver phone push notifications to (e.g. the native Scrypted NVR user-device for your phone).',
+            type: 'string',
+            value: '',
+            multiple: true,
+            group: 'Notifiers',
+            subgroup: 'Scrypted',
+            onGet: async () => ({ choices: this.getScryptedNotifierChoices() }),
+        },
+        // Sends the same real thumbnail to an HA-exposed Notifier device (e.g. a
+        // mobile_app_ notify target synced in by the Scrypted Home Assistant
+        // plugin), in addition to the notifyServices targets above. Originally
+        // added as a diagnostic-only A/B test against the native Scrypted app's
+        // delivery path (see "HA diagnostic notifier test" in PROJECT-CONTEXT.md);
+        // now built out with real HA-specific fields (category, icon, click
+        // target) as its own supported notifier option, not a replacement for the
+        // native notifyServices path above. Leave blank to disable.
+        haNotifierService: {
+            title: 'HA Notifier',
+            description: 'Select one HA-exposed Notifier device (e.g. a mobile_app_ notify target synced in by the Scrypted Home Assistant plugin) to also receive phone pushes. Leave blank to disable. Once set, each camera\'s detection rules gain their own optional Notification Category and Icon fields for this HA notifier.',
+            type: 'string',
+            value: '',
+            // Single-select: without combobox: true, a 'string' field with dynamic
+            // choices renders as a checkbox-list widget (the same visual family as
+            // notifyServices' multi-select above, just with one item) instead of a
+            // clean single-value picker - matches the combobox pattern already used
+            // for the other genuinely single-select choice fields in this plugin
+            // (cam{N}Rule{M}ClassName/Zone).
+            combobox: true,
+            group: 'Notifiers',
+            subgroup: 'Home Assistant',
+            onGet: async () => ({ choices: ['', ...this.getHomeAssistantNotifierChoices()] }),
+        },
+        haClickTarget: {
+            title: 'Tap Destination',
+            description: 'Where tapping the notification body should go. "Scrypted App" opens nvr.scrypted.app to this detection\'s timeline moment (works on iOS and Android). "Home Assistant" opens that same timeline moment inside Home Assistant\'s own UI instead, via a wrapped panel URL HA\'s Scrypted custom component provides - requires "Scrypted Integration Token" below; falls back to the Scrypted App link if that\'s blank. This mechanism was reverse-engineered from apocaliss92/scrypted-advanced-notifier\'s source (not documented by HA or Scrypted) - worth confirming live that it lands on this exact detection rather than just the camera\'s general timeline.',
+            type: 'string',
+            value: 'Scrypted App',
+            choices: ['Scrypted App', 'Home Assistant'],
+            group: 'Notifiers',
+            subgroup: 'Home Assistant',
+        },
+        haIntegrationToken: {
+            title: 'Scrypted Integration Token',
+            description: 'Required for the "Home Assistant" Tap Destination above. This is the same token Home Assistant\'s Scrypted custom component uses in its own card/resource URLs (/api/scrypted/<token>/endpoint/...) - not the Long-Lived Access Token below. Find it in Home Assistant: open a camera\'s playback view, click the settings icon, and copy the token from the "Integration URL" shown there.',
+            type: 'string',
+            group: 'Notifiers',
+            subgroup: 'Home Assistant',
+        },
+        haBaseUrl: {
+            title: 'Home Assistant URL',
+            description: 'Required for snooze buttons to work on HA notifications. Your Home Assistant instance\'s base URL (e.g. http://homeassistant.local:8123) - used to open a direct WebSocket connection so this plugin can react to snooze button taps the moment they happen, without needing any Home Assistant automation or MQTT broker.',
+            type: 'string',
+            placeholder: 'e.g. http://homeassistant.local:8123',
+            group: 'Notifiers',
+            subgroup: 'Home Assistant',
+            onPut: async () => {
+                this.startHomeAssistantEventListener();
+            },
+        },
+        haAccessToken: {
+            title: 'Long-Lived Access Token',
+            description: 'Required for snooze buttons to work on HA notifications. Generate one in Home Assistant under your profile (bottom-left, click your name) > Security > Long-Lived Access Tokens > Create Token. Used only to open the WebSocket connection above - never sent anywhere else.',
+            type: 'password',
+            group: 'Notifiers',
+            subgroup: 'Home Assistant',
+            onPut: async () => {
+                this.startHomeAssistantEventListener();
+            },
+        },
+        // Placeholder only - not yet implemented. Reserved so the tab/field layout
+        // is already in place ahead of actually wiring up an ntfy send path.
+        ntfyServerUrl: {
+            title: 'Server URL (not yet implemented)',
+            description: 'Placeholder for a future ntfy.sh (or self-hosted ntfy) notification path. Not yet functional - filling this in currently has no effect.',
+            type: 'string',
+            placeholder: 'e.g. https://ntfy.sh or your self-hosted URL',
+            group: 'Notifiers',
+            subgroup: 'ntfy (Coming Soon)',
+        },
+        ntfyTopic: {
+            title: 'Topic (not yet implemented)',
+            description: 'Placeholder for the ntfy topic to publish detections to. Not yet functional.',
+            type: 'string',
+            placeholder: 'e.g. smart-detection-relay',
+            group: 'Notifiers',
+            subgroup: 'ntfy (Coming Soon)',
+        },
+        // Placeholder only - not yet implemented. Reserved so the tab/field layout
+        // is already in place ahead of actually wiring up a Gotify send path.
+        gotifyServerUrl: {
+            title: 'Server URL (not yet implemented)',
+            description: 'Placeholder for a future Gotify notification path. Not yet functional - filling this in currently has no effect.',
+            type: 'string',
+            placeholder: 'e.g. https://gotify.example.com',
+            group: 'Notifiers',
+            subgroup: 'Gotify (Coming Soon)',
+        },
+        gotifyToken: {
+            title: 'Application Token (not yet implemented)',
+            description: 'Placeholder for the Gotify application token used to publish detections. Not yet functional.',
+            type: 'string',
+            group: 'Notifiers',
+            subgroup: 'Gotify (Coming Soon)',
         },
         // ---- Global: Detection ----
         debounceSeconds: {
@@ -199,18 +311,21 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
             description: 'Your latitude for sunrise/sunset calculation. Auto-filled on first install via "Detect Location" below (IP-based lookup) - edit directly for precision, or leave as detected.',
             type: 'number',
             placeholder: 'e.g. 33.7490',
+            group: 'Location',
         },
         longitude: {
             title: 'Longitude',
             description: 'Your longitude for sunrise/sunset calculation.',
             type: 'number',
             placeholder: 'e.g. -84.3880',
+            group: 'Location',
         },
         detectLocationButton: {
             title: 'Detect Location',
             description: 'Looks up an approximate location from this Scrypted server\'s public IP address and fills in Latitude/Longitude above. Tries a couple of free geolocation services in order in case one is temporarily rate-limited. Accurate to roughly city-level - safe to nudge the values afterward for precision. Runs automatically once on first install if Latitude/Longitude are still blank.',
             type: 'button',
             noStore: true,
+            group: 'Location',
             onPut: async (oldValue: any, newValue: any) => {
                 await this.detectLocation();
             },
@@ -220,6 +335,7 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
             description: 'Clears Latitude/Longitude. Night-mode-only cameras stop respecting sunrise/sunset until a location is set again (via "Detect Location" or manual entry) - they simply won\'t suppress notifications in the meantime.',
             type: 'button',
             noStore: true,
+            group: 'Location',
             onPut: async (oldValue: any, newValue: any) => {
                 await this.clearLocation();
             },
@@ -484,6 +600,15 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
             subgroup: this.ruleName(camSlot, ruleSlot),
             hide: !this.ruleName(camSlot, ruleSlot),
         });
+        // Same as onGet above, but additionally hidden whenever no Home Assistant
+        // notifier is configured (Notifiers > Home Assistant > HA Notifier) -
+        // these fields are meaningless without one, so there's no reason to clutter
+        // every rule's settings with them until HA is actually in the picture.
+        const haFieldOnGet = async () => ({
+            group: this.cameraGroupTitle(camSlot),
+            subgroup: this.ruleName(camSlot, ruleSlot),
+            hide: !this.ruleName(camSlot, ruleSlot) || !this.haNotifierService,
+        });
         return {
             [`cam${cs}Rule${rs}Name`]: {
                 title: 'Name',
@@ -562,6 +687,20 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
                 type: 'number',
                 onGet,
             },
+            [`cam${cs}Rule${rs}HaCategory`]: {
+                title: 'HA Notification Category (Android Channel)',
+                description: 'Optional. HA companion app notification channel/category name for this rule (e.g. "Motion Alerts"). Creates the channel on first use if it does not already exist - lets you assign a distinct sound/importance to this rule\'s notifications in the phone\'s own notification settings. Leave blank to use HA\'s default channel. Only used if a Home Assistant notifier is selected under Notifiers > Home Assistant.',
+                type: 'string',
+                placeholder: 'e.g. Motion Alerts',
+                onGet: haFieldOnGet,
+            },
+            [`cam${cs}Rule${rs}HaIcon`]: {
+                title: 'HA Notification Icon (MDI)',
+                description: 'Optional. Material Design Icon name for this rule\'s status bar icon (e.g. "mdi:cctv"), in the same "mdi:name" format used elsewhere in Home Assistant. Leave blank for HA\'s default icon. Only used if a Home Assistant notifier is selected under Notifiers > Home Assistant.',
+                type: 'string',
+                placeholder: 'e.g. mdi:cctv',
+                onGet: haFieldOnGet,
+            },
         };
     }
 
@@ -589,6 +728,7 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
                 this.setupListeners();
                 this.logWebhookUrl();
                 this.scheduleSun();
+                this.startHomeAssistantEventListener();
                 // Pre-warm the native-app notification metadata caches (serverId,
                 // localAddresses, actionUrl) at startup instead of lazily on the
                 // first real detection. These are independent, cacheable lookups
@@ -691,21 +831,39 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
         }
     }
 
+    // Production notifyServices picker: excludes HA-synced Notifier devices, since
+    // HA was fully removed from the notification path on 7/2.
     getScryptedNotifierDevices(): { id: string, key: string }[] {
+        return this.getFilteredNotifierDevices(id => {
+            try {
+                return systemManager.getDeviceById(id)?.pluginId !== HOMEASSISTANT_PLUGIN_ID;
+            } catch (e) {
+                return true;
+            }
+        });
+    }
+
+    // HA-only picker, for the haNotifierService field: it should show *only*
+    // Notifier devices synced in by the HA plugin - not every notifier on the
+    // system.
+    getHomeAssistantOnlyNotifierDevices(): { id: string, key: string }[] {
+        return this.getFilteredNotifierDevices(id => {
+            try {
+                return systemManager.getDeviceById(id)?.pluginId === HOMEASSISTANT_PLUGIN_ID;
+            } catch (e) {
+                return false;
+            }
+        });
+    }
+
+    // Shared implementation: any Notifier-interface device, filtered by the given
+    // pluginId predicate, resolved to a readable dropdown key (device name
+    // preferred, falling back to nativeId or raw device id).
+    private getFilteredNotifierDevices(idFilter: (id: string) => boolean): { id: string, key: string }[] {
         try {
             return Object.entries(systemManager.getSystemState())
                 .filter(([, d]: [string, any]) => d?.interfaces?.value?.includes(ScryptedInterface.Notifier))
-                .filter(([id]) => {
-                    // Exclude Notifier devices synced in by the HA plugin - HA is no
-                    // longer part of the notification path, so these shouldn't be
-                    // selectable here even though the HA plugin itself may still be
-                    // running on this server for other purposes.
-                    try {
-                        return systemManager.getDeviceById(id)?.pluginId !== HOMEASSISTANT_PLUGIN_ID;
-                    } catch (e) {
-                        return true;
-                    }
-                })
+                .filter(([id]) => idFilter(id))
                 .map(([id, d]: [string, any]) => {
                     // Prefer the device's own display name - far more intuitive in the
                     // settings dropdown than a raw nativeId (e.g. "114:a3753ebf" for the
@@ -729,6 +887,11 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
         return this.getScryptedNotifierDevices().map(d => d.key).sort();
     }
 
+    // HA-only choices, for the haNotifierService field only.
+    getHomeAssistantNotifierChoices(): string[] {
+        return this.getHomeAssistantOnlyNotifierDevices().map(d => d.key).sort();
+    }
+
     getNotifierDeviceIdMap(): Record<string, string> {
         const map: Record<string, string> = {};
         for (const { id, key } of this.getScryptedNotifierDevices())
@@ -736,10 +899,167 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
         return map;
     }
 
+    // HA-only id map, for the haNotifierService field only.
+    getHomeAssistantNotifierDeviceIdMap(): Record<string, string> {
+        const map: Record<string, string> = {};
+        for (const { id, key } of this.getHomeAssistantOnlyNotifierDevices())
+            map[key] = id;
+        return map;
+    }
+
+    // ---- Home Assistant event listener (snooze button taps) ----
+    //
+    // Reacts to HA notification action taps (the snooze buttons on HA-routed
+    // notifications) via a direct WebSocket connection to HA's own event bus -
+    // no HA automation authoring, no MQTT broker. Confirmed by reading
+    // apocaliss92/scrypted-advanced-notifier's source that the two relevant
+    // event types are `mobile_app_notification_action` (Android) and
+    // `ios.action_fired` (iOS), and that Android puts the tapped action's
+    // identifier under `event.data.action` while iOS puts it under
+    // `event.data.actionName`. Uses Node's built-in global WebSocket client
+    // (stable since Node 22 - no extra dependency needed) rather than HA's own
+    // richer home-assistant-js-websocket library, since all that's needed here
+    // is: connect, authenticate, subscribe to two event types, and react.
+
+    startHomeAssistantEventListener() {
+        this.stopHomeAssistantEventListener();
+        if (!this.haBaseUrl || !this.haAccessToken) {
+            this.console.log(`[HA WS] Home Assistant URL or Long-Lived Access Token not configured - snooze button taps on HA notifications will not be received.`);
+            return;
+        }
+        this.connectHaWebSocket();
+    }
+
+    stopHomeAssistantEventListener() {
+        if (this.haWsPingTimer) {
+            clearInterval(this.haWsPingTimer);
+            this.haWsPingTimer = undefined;
+        }
+        if (this.haWsReconnectTimer) {
+            clearTimeout(this.haWsReconnectTimer);
+            this.haWsReconnectTimer = undefined;
+        }
+        if (this.haWs) {
+            try { this.haWs.close(); } catch (e) { /* already closing/closed */ }
+            this.haWs = undefined;
+        }
+    }
+
+    private scheduleHaWsReconnect() {
+        if (this.haWsReconnectTimer)
+            return;
+        this.haWsReconnectTimer = setTimeout(() => {
+            this.haWsReconnectTimer = undefined;
+            if (this.haBaseUrl && this.haAccessToken)
+                this.connectHaWebSocket();
+        }, 10_000);
+    }
+
+    private connectHaWebSocket() {
+        const wsUrl = `${this.haBaseUrl.replace(/^http/, 'ws')}/api/websocket`;
+        this.console.log(`[HA WS] Connecting to ${wsUrl}`);
+
+        let ws: any;
+        try {
+            ws = new (globalThis as any).WebSocket(wsUrl);
+        }
+        catch (e) {
+            this.console.error(`[HA WS] Failed to open WebSocket`, e);
+            this.scheduleHaWsReconnect();
+            return;
+        }
+        this.haWs = ws;
+        let authenticated = false;
+
+        ws.addEventListener('message', (event: any) => {
+            let msg: any;
+            try {
+                msg = JSON.parse(typeof event.data === 'string' ? event.data : String(event.data));
+            }
+            catch (e) {
+                this.console.warn(`[HA WS] Failed to parse message from Home Assistant`, e);
+                return;
+            }
+
+            switch (msg.type) {
+                case 'auth_required':
+                    ws.send(JSON.stringify({ type: 'auth', access_token: this.haAccessToken }));
+                    break;
+                case 'auth_ok':
+                    authenticated = true;
+                    this.console.log(`[HA WS] Authenticated - listening for notification action taps`);
+                    this.haWsSubscribe(ws, 'mobile_app_notification_action');
+                    this.haWsSubscribe(ws, 'ios.action_fired');
+                    this.startHaWsPing(ws);
+                    break;
+                case 'auth_invalid':
+                    this.console.error(`[HA WS] Authentication failed - check the Long-Lived Access Token.${msg.message ? ` (${msg.message})` : ''}`);
+                    ws.close();
+                    break;
+                case 'event':
+                    if (msg.event?.event_type)
+                        this.handleHaEvent(msg.event);
+                    break;
+                case 'result':
+                    if (msg.success === false)
+                        this.console.warn(`[HA WS] Command failed:`, JSON.stringify(msg));
+                    break;
+                // 'pong' (keepalive ack) needs no handling.
+            }
+        });
+
+        ws.addEventListener('close', () => {
+            this.console.log(`[HA WS] Connection closed${authenticated ? '' : ' (never authenticated)'} - reconnecting shortly`);
+            this.haWs = undefined;
+            if (this.haWsPingTimer) {
+                clearInterval(this.haWsPingTimer);
+                this.haWsPingTimer = undefined;
+            }
+            this.scheduleHaWsReconnect();
+        });
+
+        ws.addEventListener('error', (e: any) => {
+            this.console.warn(`[HA WS] Connection error:`, e?.message ?? e);
+        });
+    }
+
+    private haWsSubscribe(ws: any, eventType: string) {
+        ws.send(JSON.stringify({ id: this.haWsMessageId++, type: 'subscribe_events', event_type: eventType }));
+    }
+
+    private startHaWsPing(ws: any) {
+        this.haWsPingTimer = setInterval(() => {
+            if (ws.readyState === 1 /* OPEN */)
+                ws.send(JSON.stringify({ id: this.haWsMessageId++, type: 'ping' }));
+        }, 30_000);
+    }
+
+    private handleHaEvent(event: any) {
+        const actionString: string | undefined = event?.data?.action ?? event?.data?.actionName;
+        if (!actionString)
+            return;
+        const parsed = parseSnoozeAction(actionString);
+        if (!parsed)
+            return; // Some other HA notification's action tap, not one of ours - ignore.
+        this.setSnoozed(parsed.cameraId, parsed.className, parsed.minutes);
+        this.console.log(`[HA WS] Snoozed ${parsed.className} on camera ${parsed.cameraId} for ${parsed.minutes} minutes (via Home Assistant event bus)`);
+    }
+
     // Zone names aren't exposed as a first-class SDK property - they live inside
-    // the object detection plugin's own settings on the camera device, under a key
-    // matching /objectdetectionplugin:.*:zones/. Confirmed by reading
-    // scrypted-advanced-notifier's source (src/cameraMixin.ts getObserveZones()).
+    // the active object detector's own settings on the camera device, under a key
+    // ending in ":zones". Originally matched only /objectdetectionplugin:.*:zones/
+    // (Scrypted's native NVR object detection plugin, confirmed by reading
+    // scrypted-advanced-notifier's source, src/cameraMixin.ts getObserveZones()).
+    // Broadened 7/10 to a plain ":zones" suffix match after confirming live via
+    // the Scrypted REPL that @apocaliss92/scrypted-frigate-bridge's object
+    // detector mixin exposes zones under a differently-shaped key with no
+    // per-device id segment at all: "frigateObjectDetector:zones" (value e.g.
+    // ["back_yard"]), which the old regex never matched. A plain suffix match
+    // covers both plugins' key formats (and any future detector following the
+    // same "<prefix>:zones" convention) without needing to special-case each
+    // one by name. Verified this doesn't false-positive against Frigate Bridge's
+    // other keys - e.g. "frigateObjectDetector:zone:back_yard:type" ends in
+    // ":type", not ":zones", so it's correctly excluded.
     // Cached briefly per device id, since each visible rule slot's Zone dropdown
     // calls this independently via its own onGet - without a cache, a camera with
     // several rule slots would trigger that many redundant device.getSettings()
@@ -756,7 +1076,7 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
                 return [];
             const deviceSettings: any[] = await device.getSettings();
             const zonesSetting = deviceSettings.find((setting: any) =>
-                /objectdetectionplugin:.*:zones/.test(setting?.key ?? '')
+                /:zones$/.test(setting?.key ?? '')
             );
             const zones = zonesSetting?.value;
             const choices = Array.isArray(zones) ? zones.filter(Boolean) : [];
@@ -826,6 +1146,27 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
         if (Array.isArray(val)) return val.filter(Boolean);
         if (typeof val === 'string' && val) return [val];
         return [];
+    }
+
+    // HA notifier (see settings field definition above).
+    get haNotifierService(): string {
+        return (this.settingsStorage.values.haNotifierService as string) || '';
+    }
+
+    get haClickTarget(): 'Scrypted App' | 'Home Assistant' {
+        return (this.settingsStorage.values.haClickTarget as string) === 'Home Assistant' ? 'Home Assistant' : 'Scrypted App';
+    }
+
+    get haIntegrationToken(): string {
+        return (this.settingsStorage.values.haIntegrationToken as string) || '';
+    }
+
+    get haBaseUrl(): string {
+        return ((this.settingsStorage.values.haBaseUrl as string) || '').trim().replace(/\/+$/, '');
+    }
+
+    get haAccessToken(): string {
+        return (this.settingsStorage.values.haAccessToken as string) || '';
     }
 
     get tvHosts(): string[] {
@@ -933,6 +1274,13 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
 
                 const rule: ClassZoneRule = { name, className, zone, scoreThreshold, critical };
 
+                const haCategory = (this.settingsStorage.values[`cam${s}Rule${rs}HaCategory`] as string || '').trim();
+                if (haCategory)
+                    rule.haCategory = haCategory;
+                const haIcon = (this.settingsStorage.values[`cam${s}Rule${rs}HaIcon`] as string || '').trim();
+                if (haIcon)
+                    rule.haIcon = haIcon;
+
                 const minWidthRaw = this.settingsStorage.values[`cam${s}Rule${rs}MinWidth`];
                 if (minWidthRaw !== undefined && minWidthRaw !== '' && Number.isFinite(Number(minWidthRaw)))
                     rule.minWidth = Number(minWidthRaw);
@@ -981,6 +1329,21 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
 
     setSnoozed(cameraId: string, className: string, minutes: number) {
         const key = this.snoozeKey(cameraId, className);
+        // The same detection routes to multiple notifiers (native app, HA, TV
+        // overlay), so it's normal for the same person to tap a snooze button on
+        // more than one of them for what's really a single event - each notifier
+        // has its own independent callback path (onRequest webhook for the native
+        // app, the HA WebSocket event listener for HA) with no way to know the
+        // other already fired. Without this check, a second tap would silently
+        // extend the snooze window from whenever it happened to land, rather than
+        // from the original tap - surprising and not really what either tap
+        // intended. Once a snooze is already active for this camera/class, treat
+        // further taps as a no-op instead of resetting the timer.
+        if (this.isSnoozed(cameraId, className)) {
+            const remainingMs = this.snoozedUntil[key] - Date.now();
+            this.console.log(`[${new Date().toLocaleTimeString()}]`, `${key} already snoozed for another ${Math.ceil(remainingMs / 60000)} minute(s) - ignoring duplicate snooze request (likely a tap on another notifier for the same detection)`);
+            return;
+        }
         this.snoozedUntil[key] = Date.now() + minutes * 60 * 1000;
         this.console.log(`[${new Date().toLocaleTimeString()}]`, `Snoozed ${key} for ${minutes} minutes`);
     }
@@ -1124,7 +1487,7 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
 
     // ---- Phone push ----
 
-    async sendPhonePush(cameraName: string, cameraId: string, className: string, title: string, thumbnail: { dataUrl: string, buffer: Buffer } | undefined, eventData?: any, eventDetails?: EventDetails, critical?: boolean) {
+    async sendPhonePush(cameraName: string, cameraId: string, className: string, title: string, thumbnail: { dataUrl: string, buffer: Buffer } | undefined, eventData?: any, eventDetails?: EventDetails, critical?: boolean, haCategory?: string, haIcon?: string) {
         const actions = this.snoozeOptions.map(opt => ({
             action: buildSnoozeAction(cameraId, className, opt.minutes),
             title: opt.title,
@@ -1158,6 +1521,14 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
         // a serverId, since that's the shape the app's own internal navigation expects
         // (confirmed via scrypted-advanced-notifier's getUrls()).
         const nativeHash = `#/timeline/${cameraId}?time=${Date.now()}&from=notification&serverId=${serverId ?? ''}&disableTransition=true`;
+        // Same route, but as a full URL against Scrypted's hosted NVR web app -
+        // used for notifications routed through HA, since HA's companion app has no
+        // concept of the native app's internal hash-only navigation and instead
+        // needs an actual openable URL (data.url on iOS, data.clickAction on
+        // Android - both accept a full https:// URL and open it in-browser on tap,
+        // per the HA companion docs). Reuses the identical cameraId/time/serverId
+        // as nativeHash so both paths land on the same timeline moment.
+        const nvrWebUrl = `https://nvr.scrypted.app/${nativeHash}`;
 
         const notifierOptions: NotifierOptions = {
             body: `${channel} Detected. Tap to view.`,
@@ -1186,7 +1557,7 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
         };
 
         const deviceIdMap = this.getNotifierDeviceIdMap();
-        await Promise.all(this.notifyServices.map(async service => {
+        const nativeSendPromise = Promise.all(this.notifyServices.map(async service => {
             const deviceId = deviceIdMap[service];
             const device: any = deviceId ? systemManager.getDeviceById(deviceId) : undefined;
             if (!device) {
@@ -1201,6 +1572,82 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
                 this.console.error(`[${new Date().toLocaleTimeString()}]`, `sendPhonePush (Notifier) failed for ${service}`, e);
             }
         }));
+
+        // Sends to an HA-exposed notifier, if configured, in addition to the
+        // notifyServices targets above. Kicked off alongside nativeSendPromise
+        // (not awaited afterward) so the two don't stack sequentially - total time
+        // is bounded by whichever is slowest, not their sum. Isolation from the
+        // native path is preserved by keeping this as its own independent
+        // promise/try-catch, just started concurrently.
+        const haSendPromise = (async () => {
+            if (!this.haNotifierService)
+                return;
+            try {
+                const haDeviceId = this.getHomeAssistantNotifierDeviceIdMap()[this.haNotifierService];
+                const haDevice: any = haDeviceId ? systemManager.getDeviceById(haDeviceId) : undefined;
+                if (!haDevice) {
+                    this.console.warn(`[${new Date().toLocaleTimeString()}]`, `[HA] Notifier device not found for service: ${this.haNotifierService}`);
+                } else {
+                    // Tap destination: "Home Assistant" opens the Scrypted NVR timeline
+                    // *inside* Home Assistant's own UI - confirmed by reading
+                    // apocaliss92/scrypted-advanced-notifier's source (getUrls() in
+                    // main.ts), the same approach already used for the native app's
+                    // undocumented tap-to-timeline/snooze fields. HA's own docs describe
+                    // only the inner "/api/scrypted/<token>/endpoint/.../<hash>" proxy path
+                    // (used for embedding dashboard cards) - opening that alone, as a bare
+                    // relative URL, is what produced the unstyled "skewed still shot" seen
+                    // earlier. The actual working shape wraps that in a second layer,
+                    // /scrypted_<token>?url=<encoded inner URL>, which is a custom panel
+                    // route the HA Scrypted component registers - that's what renders inside
+                    // HA's own chrome instead of as a bare iframe. Reuses the exact same
+                    // nativeHash as the native Scrypted app path above, so both land on the
+                    // same timeline moment.
+                    const haInnerUrl = `/api/scrypted/${this.haIntegrationToken}/endpoint/@scrypted/nvr/public/${nativeHash}`;
+                    const haPanelUrl = `/scrypted_${this.haIntegrationToken}?url=${encodeURIComponent(haInnerUrl)}`;
+                    const clickTarget = (this.haClickTarget === 'Home Assistant' && this.haIntegrationToken)
+                        ? haPanelUrl
+                        : nvrWebUrl;
+
+                    // Snooze buttons for HA: unlike the native Scrypted app (which POSTs
+                    // { snoozeId, actionId } to data.actionUrl when a NotifierOptions.actions[]
+                    // button is tapped), HA's own actionable-notification actions have no
+                    // automatic callback of their own - tapping one just fires HA's internal
+                    // mobile_app_notification_action (Android) or ios.action_fired (iOS) event
+                    // on HA's event bus. This plugin listens for those events directly over a
+                    // WebSocket connection (see startHomeAssistantEventListener()), so the same
+                    // plain action identifiers already built for the native app above
+                    // (buildSnoozeAction, no `uri` needed) work here unchanged - tapping fires
+                    // the HA event, our listener picks it up, and the snooze applies
+                    // immediately. No HA automation authoring, no MQTT broker required.
+                    await haDevice.sendNotification(title, {
+                        body: `${channel} Detected. Tap to view.`,
+                        data: {
+                            // The Scrypted Home Assistant plugin's own Notifier device only
+                            // forwards fields nested under data.ha into the actual HA notify
+                            // service call (Object.assign(data, options.data.ha) inside its
+                            // notify.ts) - anything placed at the top level of `data` is
+                            // silently dropped. HA's own notify data schema reads `url` on
+                            // iOS, `clickAction` on Android, `channel` for the Android
+                            // notification channel/category, and `notification_icon` for the
+                            // status bar MDI icon.
+                            ha: {
+                                url: clickTarget,
+                                clickAction: clickTarget,
+                                actions,
+                                ...(haCategory ? { channel: haCategory } : {}),
+                                ...(haIcon ? { notification_icon: haIcon } : {}),
+                            },
+                        },
+                    }, media);
+                    this.console.log(`[${new Date().toLocaleTimeString()}]`, `[HA] Sent notification for ${cameraName} ${className} via ${this.haNotifierService}`);
+                }
+            }
+            catch (e) {
+                this.console.error(`[${new Date().toLocaleTimeString()}]`, `[HA] sendPhonePush failed for ${this.haNotifierService}`, e);
+            }
+        })();
+
+        await Promise.all([nativeSendPromise, haSendPromise]);
     }
 
     // ---- TV overlay ----
@@ -1678,7 +2125,7 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
         return this.snapshotToDataUrl(camera);
     }
 
-    async fireNotification(config: CameraRelayConfig, camera: any, cameraName: string, detection: any, eventData: any, eventDetails: EventDetails, fixedCrop?: [number, number, number, number], critical?: boolean) {
+    async fireNotification(config: CameraRelayConfig, camera: any, cameraName: string, detection: any, eventData: any, eventDetails: EventDetails, fixedCrop?: [number, number, number, number], critical?: boolean, haCategory?: string, haIcon?: string) {
         // Belt-and-suspenders: setupListeners() already stops new detections from
         // reaching here when disabled (globally or per-camera), but a
         // thumbnailWindow timer armed just before the switch was flipped can
@@ -1696,7 +2143,7 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
 
         await Promise.all([
             this.notifyTvs(cameraName, detection.className, thumbnail?.dataUrl),
-            this.sendPhonePush(cameraName, config.id, detection.className, cameraName, thumbnail, eventData, eventDetails, critical),
+            this.sendPhonePush(cameraName, config.id, detection.className, cameraName, thumbnail, eventData, eventDetails, critical, haCategory, haIcon),
         ]);
     }
 
@@ -1704,11 +2151,11 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
         const pending = this.pendingDetections.get(pendingKey);
         if (!pending) return;
         this.pendingDetections.delete(pendingKey);
-        const { detection, eventData, eventDetails, camera, config, fixedCrop, critical } = pending;
+        const { detection, eventData, eventDetails, camera, config, fixedCrop, critical, haCategory, haIcon } = pending;
         const cameraName = camera.name ?? config.id;
         const [, , bw] = Array.isArray(detection.boundingBox) ? detection.boundingBox : [0, 0, 0, 0];
         this.console.log(`[${new Date().toLocaleTimeString()}]`, `Firing pending detection for ${cameraName} ${detection.className} with best bounding box width ${bw}px`);
-        await this.fireNotification(config, camera, cameraName, detection, eventData, eventDetails, fixedCrop, critical);
+        await this.fireNotification(config, camera, cameraName, detection, eventData, eventDetails, fixedCrop, critical, haCategory, haIcon);
     }
 
     // ---- Main detection handler ----
@@ -1785,19 +2232,19 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
                     if (bw > existingBw) {
                         clearTimeout(existing.timer);
                         const timer = setTimeout(() => this.firePendingDetection(pendingKey), config.thumbnailWindow * 1000);
-                        this.pendingDetections.set(pendingKey, { detection, eventData, eventDetails, camera, config, fixedCrop: matchedRule.fixedCrop, critical: matchedRule.critical, timer });
+                        this.pendingDetections.set(pendingKey, { detection, eventData, eventDetails, camera, config, fixedCrop: matchedRule.fixedCrop, critical: matchedRule.critical, haCategory: matchedRule.haCategory, haIcon: matchedRule.haIcon, timer });
                         this.console.log(`[${new Date().toLocaleTimeString()}]`, `Updated pending detection for ${cameraName} ${detection.className}: wider box ${bw}px > ${existingBw}px`);
                     }
                 } else {
                     // First detection in window — commit debounce now, start window
                     const timer = setTimeout(() => this.firePendingDetection(pendingKey), config.thumbnailWindow * 1000);
-                    this.pendingDetections.set(pendingKey, { detection, eventData, eventDetails, camera, config, fixedCrop: matchedRule.fixedCrop, critical: matchedRule.critical, timer });
+                    this.pendingDetections.set(pendingKey, { detection, eventData, eventDetails, camera, config, fixedCrop: matchedRule.fixedCrop, critical: matchedRule.critical, haCategory: matchedRule.haCategory, haIcon: matchedRule.haIcon, timer });
                     this.console.log(`[${new Date().toLocaleTimeString()}]`, `Started thumbnail window for ${cameraName} ${detection.className}: ${config.thumbnailWindow}s`);
                 }
                 return;
             }
 
-            await this.fireNotification(config, camera, cameraName, detection, eventData, eventDetails, matchedRule.fixedCrop, matchedRule.critical);
+            await this.fireNotification(config, camera, cameraName, detection, eventData, eventDetails, matchedRule.fixedCrop, matchedRule.critical, matchedRule.haCategory, matchedRule.haIcon);
             return;
         }
     }

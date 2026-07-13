@@ -1,6 +1,9 @@
 <details>
 <summary>Changelog</summary>
 
+<h3>0.3.0</h3>
+<p>Home Assistant is now a fully supported notifier alongside the native Scrypted app - optional, and off by default. Settings are reorganized into dedicated tabs: TV Overlay, Location, and a new Notifiers tab with sub-tabs per notifier type (Scrypted, Home Assistant, and placeholders for ntfy/Gotify support planned in a future release). When a Home Assistant notifier is selected, each detection rule gains optional Notification Category and Icon fields for that notifier. A new Tap Destination option lets HA notifications open either the Scrypted app (as before) or the Scrypted NVR timeline hosted inside Home Assistant's own UI. Snooze buttons now work on Home Assistant notifications too, via a direct connection this plugin opens to Home Assistant's own event stream (requires a Home Assistant URL and Long-Lived Access Token, entered once under Notifiers > Home Assistant) - no Home Assistant automation authoring or MQTT broker required. Home Assistant credentials are only requested and only stored if you actually configure a Home Assistant notifier; the plugin remains fully usable with zero third-party credentials if you stick to the native Scrypted notification path.</p>
+
 <h3>0.2.8</h3>
 <p>Fixed a rare crop error that could cause a notification to fall back to an uncropped full-frame image instead of the intended thumbnail. This only happened for detections positioned close enough to a camera frame edge to trigger an edge case in the crop rounding math - now fixed so the crop always stays within the frame.</p>
 
