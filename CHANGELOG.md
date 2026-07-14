@@ -1,6 +1,9 @@
 <details>
 <summary>Changelog</summary>
 
+<h3>0.3.1</h3>
+<p>Fixed Home Assistant snooze buttons not working. The plugin was listening for the wrong iOS notification-action event name, and the connection to Home Assistant could silently stop reconnecting after a network hiccup or Home Assistant restart until the plugin itself was restarted. Both are fixed - snooze buttons on Home Assistant notifications should now work reliably, including recovering on their own after a brief Home Assistant outage.</p>
+
 <h3>0.3.0</h3>
 <p>Home Assistant is now a fully supported notifier alongside the native Scrypted app - optional, and off by default. Settings are reorganized into dedicated tabs: TV Overlay, Location, and a new Notifiers tab with sub-tabs per notifier type (Scrypted, Home Assistant, and placeholders for ntfy/Gotify support planned in a future release). When a Home Assistant notifier is selected, each detection rule gains optional Notification Category and Icon fields for that notifier. A new Tap Destination option lets HA notifications open either the Scrypted app (as before) or the Scrypted NVR timeline hosted inside Home Assistant's own UI. Snooze buttons now work on Home Assistant notifications too, via a direct connection this plugin opens to Home Assistant's own event stream (requires a Home Assistant URL and Long-Lived Access Token, entered once under Notifiers > Home Assistant) - no Home Assistant automation authoring or MQTT broker required. Home Assistant credentials are only requested and only stored if you actually configure a Home Assistant notifier; the plugin remains fully usable with zero third-party credentials if you stick to the native Scrypted notification path.</p>
 

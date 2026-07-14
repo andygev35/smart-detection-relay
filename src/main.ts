@@ -914,7 +914,7 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
     // no HA automation authoring, no MQTT broker. Confirmed by reading
     // apocaliss92/scrypted-advanced-notifier's source that the two relevant
     // event types are `mobile_app_notification_action` (Android) and
-    // `ios.action_fired` (iOS), and that Android puts the tapped action's
+    // `ios.notification_action_fired` (iOS), and that Android puts the tapped action's
     // identifier under `event.data.action` while iOS puts it under
     // `event.data.actionName`. Uses Node's built-in global WebSocket client
     // (stable since Node 22 - no extra dependency needed) rather than HA's own
@@ -989,7 +989,7 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
                     authenticated = true;
                     this.console.log(`[HA WS] Authenticated - listening for notification action taps`);
                     this.haWsSubscribe(ws, 'mobile_app_notification_action');
-                    this.haWsSubscribe(ws, 'ios.action_fired');
+                    this.haWsSubscribe(ws, 'ios.notification_action_fired');
                     this.startHaWsPing(ws);
                     break;
                 case 'auth_invalid':
@@ -1010,17 +1010,37 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
 
         ws.addEventListener('close', () => {
             this.console.log(`[HA WS] Connection closed${authenticated ? '' : ' (never authenticated)'} - reconnecting shortly`);
-            this.haWs = undefined;
-            if (this.haWsPingTimer) {
-                clearInterval(this.haWsPingTimer);
-                this.haWsPingTimer = undefined;
-            }
+            this.cleanupHaWs(ws);
             this.scheduleHaWsReconnect();
         });
 
+        // Node's built-in WebSocket (undici-backed) does not reliably emit 'close'
+        // after a failed handshake/connection error - confirmed live 7/14: a
+        // "Received network error or non-101 status code" error was logged with
+        // no subsequent "Connection closed" line and no reconnect attempt for
+        // 12+ minutes (until the next manual plugin restart), silently killing
+        // snooze-button delivery with zero further log output to hint at it.
+        // Scheduling the reconnect here too, as a backstop, closes that gap -
+        // scheduleHaWsReconnect() already guards against a duplicate timer for
+        // the case where 'close' does also fire right after.
         ws.addEventListener('error', (e: any) => {
             this.console.warn(`[HA WS] Connection error:`, e?.message ?? e);
+            this.cleanupHaWs(ws);
+            this.scheduleHaWsReconnect();
         });
+    }
+
+    // Shared teardown for the 'close' and 'error' paths - only acts if `ws` is
+    // still the currently-active socket (avoids a stale/already-superseded
+    // socket's error handler clobbering a newer connection's state).
+    private cleanupHaWs(ws: any) {
+        if (this.haWs !== ws)
+            return;
+        this.haWs = undefined;
+        if (this.haWsPingTimer) {
+            clearInterval(this.haWsPingTimer);
+            this.haWsPingTimer = undefined;
+        }
     }
 
     private haWsSubscribe(ws: any, eventType: string) {
@@ -1612,7 +1632,7 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
                     // { snoozeId, actionId } to data.actionUrl when a NotifierOptions.actions[]
                     // button is tapped), HA's own actionable-notification actions have no
                     // automatic callback of their own - tapping one just fires HA's internal
-                    // mobile_app_notification_action (Android) or ios.action_fired (iOS) event
+                    // mobile_app_notification_action (Android) or ios.notification_action_fired (iOS) event
                     // on HA's event bus. This plugin listens for those events directly over a
                     // WebSocket connection (see startHomeAssistantEventListener()), so the same
                     // plain action identifiers already built for the native app above
