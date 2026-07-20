@@ -10,7 +10,14 @@ const NUM_RULE_SLOTS = 8;
 // custom class names (e.g. specific animal subtypes) not in this preset list.
 const DETECTION_CLASS_CHOICES = ['person', 'vehicle', 'animal', 'package', 'face', 'plate'];
 // All the per-rule storage key suffixes - used to bulk-clear a rule slot on removal.
-const RULE_FIELD_SUFFIXES = ['Name', 'ClassName', 'Zone', 'ScoreThreshold', 'Critical', 'FixedCrop', 'MinWidth', 'MinHeight', 'MaxX', 'MaxY', 'HaCategory', 'HaIcon'];
+const RULE_FIELD_SUFFIXES = ['Name', 'ClassName', 'Zone', 'ScoreThreshold', 'Critical', 'FixedCrop', 'MinWidth', 'MinHeight', 'MaxX', 'MaxY', 'HaCategory', 'HaIcon', 'NtfyPriority'];
+// ntfy's five named priority levels (https://docs.ntfy.sh/publish/#message-priority).
+// "Auto" (the field's default/blank state) isn't a real ntfy value - it means
+// "fall back to the existing Critical Alert flag" (critical -> max, else default),
+// preserving the same behavior as before this field existed for anyone who
+// doesn't touch it.
+const NTFY_PRIORITY_AUTO = 'Auto (use Critical Alert)';
+const NTFY_PRIORITY_CHOICES = [NTFY_PRIORITY_AUTO, 'Min', 'Low', 'Default', 'High', 'Max'];
 const GET_DETECTION_INPUT_RETRIES = [0, 300, 700, 1200, 2000];
 const MIN_PLAUSIBLE_IMAGE_BYTES = 5000;
 // Scrypted's Home Assistant plugin still syncs its own Notifier-interface devices
@@ -48,6 +55,7 @@ interface ClassZoneRule {
     critical?: boolean;  // send as a critical push notification (louder/bypassing-DND alert sound) instead of normal
     haCategory?: string; // HA notification channel/category name (only used if an HA notifier is configured)
     haIcon?: string;     // HA notification status bar MDI icon, e.g. "mdi:cctv" (only used if an HA notifier is configured)
+    ntfyPriority?: string; // ntfy priority: "Min"/"Low"/"Default"/"High"/"Max" (only used if ntfy is configured); unset means "use the critical flag above instead"
 }
 
 interface CameraRelayConfig {
@@ -132,7 +140,7 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
     cachedLocalAddresses: string[] | undefined;
     cachedActionUrl: string | undefined;
     // key: `${cameraId}-${className}`, value: best detection seen so far during window
-    pendingDetections: Map<string, { detection: any, eventData: any, eventDetails: EventDetails, camera: any, config: CameraRelayConfig, fixedCrop?: [number, number, number, number], critical?: boolean, haCategory?: string, haIcon?: string, timer: NodeJS.Timeout }> = new Map();
+    pendingDetections: Map<string, { detection: any, eventData: any, eventDetails: EventDetails, camera: any, config: CameraRelayConfig, fixedCrop?: [number, number, number, number], critical?: boolean, haCategory?: string, haIcon?: string, ntfyPriority?: string, timer: NodeJS.Timeout }> = new Map();
 
     // Direct WebSocket connection to Home Assistant's event bus, used solely to
     // react to HA notification action taps (snooze buttons) the instant they
@@ -631,6 +639,13 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
             subgroup: this.ruleName(camSlot, ruleSlot),
             hide: !this.ruleName(camSlot, ruleSlot) || !this.haNotifierService,
         });
+        // Same idea, hidden unless ntfy is configured (Notifiers > ntfy > Server
+        // URL + Topic both set).
+        const ntfyFieldOnGet = async () => ({
+            group: this.cameraGroupTitle(camSlot),
+            subgroup: this.ruleName(camSlot, ruleSlot),
+            hide: !this.ruleName(camSlot, ruleSlot) || !this.ntfyServerUrl || !this.ntfyTopic,
+        });
         return {
             [`cam${cs}Rule${rs}Name`]: {
                 title: 'Name',
@@ -722,6 +737,15 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
                 type: 'string',
                 placeholder: 'e.g. mdi:cctv',
                 onGet: haFieldOnGet,
+            },
+            [`cam${cs}Rule${rs}NtfyPriority`]: {
+                title: 'ntfy Priority',
+                description: 'Optional. ntfy notification priority for this rule - controls vibration pattern/sound behavior in the ntfy Android app (untested on iOS, ntfy\'s own docs don\'t specify iOS-side differences by priority). "Auto" uses the Critical Alert setting above instead (Critical → Max, otherwise Default) - same behavior as before this field existed. Only used if ntfy is configured under Notifiers > ntfy.',
+                type: 'string',
+                combobox: true,
+                choices: NTFY_PRIORITY_CHOICES,
+                value: NTFY_PRIORITY_AUTO,
+                onGet: ntfyFieldOnGet,
             },
         };
     }
@@ -1337,6 +1361,9 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
                 const haIcon = (this.settingsStorage.values[`cam${s}Rule${rs}HaIcon`] as string || '').trim();
                 if (haIcon)
                     rule.haIcon = haIcon;
+                const ntfyPriorityRaw = (this.settingsStorage.values[`cam${s}Rule${rs}NtfyPriority`] as string || '').trim();
+                if (ntfyPriorityRaw && ntfyPriorityRaw !== NTFY_PRIORITY_AUTO)
+                    rule.ntfyPriority = ntfyPriorityRaw;
 
                 const minWidthRaw = this.settingsStorage.values[`cam${s}Rule${rs}MinWidth`];
                 if (minWidthRaw !== undefined && minWidthRaw !== '' && Number.isFinite(Number(minWidthRaw)))
@@ -1544,7 +1571,7 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
 
     // ---- Phone push ----
 
-    async sendPhonePush(cameraName: string, cameraId: string, className: string, title: string, thumbnail: { dataUrl: string, buffer: Buffer } | undefined, eventData?: any, eventDetails?: EventDetails, critical?: boolean, haCategory?: string, haIcon?: string) {
+    async sendPhonePush(cameraName: string, cameraId: string, className: string, title: string, thumbnail: { dataUrl: string, buffer: Buffer } | undefined, eventData?: any, eventDetails?: EventDetails, critical?: boolean, haCategory?: string, haIcon?: string, ntfyPriority?: string) {
         const actions = this.snoozeOptions.map(opt => ({
             action: buildSnoozeAction(cameraId, className, opt.minutes),
             title: opt.title,
@@ -1728,7 +1755,13 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
                     // names in this plugin are expected to be plain ASCII in practice
                     // (device names, detector class names), so no extra encoding here.
                     'Title': `${cameraName} - ${channel} Detected`,
-                    'Priority': critical ? 'urgent' : 'default',
+                    // Per-rule "ntfy Priority" (Min/Low/Default/High/Max) takes
+                    // precedence when set (Notifiers > ntfy per-rule field, hidden
+                    // until ntfy is configured). Left as "Auto" (the field's
+                    // default), it falls back to the same behavior this plugin
+                    // already used before the field existed: the shared Critical
+                    // Alert flag maps to ntfy's max priority, otherwise default.
+                    'Priority': ntfyPriority ? ntfyPriority.toLowerCase() : (critical ? 'max' : 'default'),
                     'Tags': NTFY_CLASS_TAGS[className] ?? NTFY_DEFAULT_TAG,
                     // Tapping the notification opens the same Scrypted NVR timeline
                     // moment as the native app and HA paths above - reuses nvrWebUrl
@@ -2346,7 +2379,7 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
         return this.snapshotToDataUrl(camera);
     }
 
-    async fireNotification(config: CameraRelayConfig, camera: any, cameraName: string, detection: any, eventData: any, eventDetails: EventDetails, fixedCrop?: [number, number, number, number], critical?: boolean, haCategory?: string, haIcon?: string) {
+    async fireNotification(config: CameraRelayConfig, camera: any, cameraName: string, detection: any, eventData: any, eventDetails: EventDetails, fixedCrop?: [number, number, number, number], critical?: boolean, haCategory?: string, haIcon?: string, ntfyPriority?: string) {
         // Belt-and-suspenders: setupListeners() already stops new detections from
         // reaching here when disabled (globally or per-camera), but a
         // thumbnailWindow timer armed just before the switch was flipped can
@@ -2364,7 +2397,7 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
 
         await Promise.all([
             this.notifyTvs(cameraName, detection.className, thumbnail?.dataUrl),
-            this.sendPhonePush(cameraName, config.id, detection.className, cameraName, thumbnail, eventData, eventDetails, critical, haCategory, haIcon),
+            this.sendPhonePush(cameraName, config.id, detection.className, cameraName, thumbnail, eventData, eventDetails, critical, haCategory, haIcon, ntfyPriority),
         ]);
     }
 
@@ -2372,11 +2405,11 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
         const pending = this.pendingDetections.get(pendingKey);
         if (!pending) return;
         this.pendingDetections.delete(pendingKey);
-        const { detection, eventData, eventDetails, camera, config, fixedCrop, critical, haCategory, haIcon } = pending;
+        const { detection, eventData, eventDetails, camera, config, fixedCrop, critical, haCategory, haIcon, ntfyPriority } = pending;
         const cameraName = camera.name ?? config.id;
         const [, , bw] = Array.isArray(detection.boundingBox) ? detection.boundingBox : [0, 0, 0, 0];
         this.console.log(`[${new Date().toLocaleTimeString()}]`, `Firing pending detection for ${cameraName} ${detection.className} with best bounding box width ${bw}px`);
-        await this.fireNotification(config, camera, cameraName, detection, eventData, eventDetails, fixedCrop, critical, haCategory, haIcon);
+        await this.fireNotification(config, camera, cameraName, detection, eventData, eventDetails, fixedCrop, critical, haCategory, haIcon, ntfyPriority);
     }
 
     // ---- Main detection handler ----
@@ -2453,19 +2486,19 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
                     if (bw > existingBw) {
                         clearTimeout(existing.timer);
                         const timer = setTimeout(() => this.firePendingDetection(pendingKey), config.thumbnailWindow * 1000);
-                        this.pendingDetections.set(pendingKey, { detection, eventData, eventDetails, camera, config, fixedCrop: matchedRule.fixedCrop, critical: matchedRule.critical, haCategory: matchedRule.haCategory, haIcon: matchedRule.haIcon, timer });
+                        this.pendingDetections.set(pendingKey, { detection, eventData, eventDetails, camera, config, fixedCrop: matchedRule.fixedCrop, critical: matchedRule.critical, haCategory: matchedRule.haCategory, haIcon: matchedRule.haIcon, ntfyPriority: matchedRule.ntfyPriority, timer });
                         this.console.log(`[${new Date().toLocaleTimeString()}]`, `Updated pending detection for ${cameraName} ${detection.className}: wider box ${bw}px > ${existingBw}px`);
                     }
                 } else {
                     // First detection in window — commit debounce now, start window
                     const timer = setTimeout(() => this.firePendingDetection(pendingKey), config.thumbnailWindow * 1000);
-                    this.pendingDetections.set(pendingKey, { detection, eventData, eventDetails, camera, config, fixedCrop: matchedRule.fixedCrop, critical: matchedRule.critical, haCategory: matchedRule.haCategory, haIcon: matchedRule.haIcon, timer });
+                    this.pendingDetections.set(pendingKey, { detection, eventData, eventDetails, camera, config, fixedCrop: matchedRule.fixedCrop, critical: matchedRule.critical, haCategory: matchedRule.haCategory, haIcon: matchedRule.haIcon, ntfyPriority: matchedRule.ntfyPriority, timer });
                     this.console.log(`[${new Date().toLocaleTimeString()}]`, `Started thumbnail window for ${cameraName} ${detection.className}: ${config.thumbnailWindow}s`);
                 }
                 return;
             }
 
-            await this.fireNotification(config, camera, cameraName, detection, eventData, eventDetails, matchedRule.fixedCrop, matchedRule.critical, matchedRule.haCategory, matchedRule.haIcon);
+            await this.fireNotification(config, camera, cameraName, detection, eventData, eventDetails, matchedRule.fixedCrop, matchedRule.critical, matchedRule.haCategory, matchedRule.haIcon, matchedRule.ntfyPriority);
             return;
         }
     }
