@@ -1,6 +1,6 @@
 # Smart Detection Relay
 
-Routes Scrypted NVR's object-detection events to **Android TV overlays** and **phone push notifications** — with cropped thumbnails, snooze buttons, and tap-to-timeline deep links. Notifications are delivered through the native Scrypted SDK by default, with no third-party credentials required. Home Assistant is available as an additional, fully optional notifier — enabling it lets you use HA-specific notification options (categories, icons, and a tap destination that opens Home Assistant's own Scrypted NVR timeline), and is the only case where this plugin stores any third-party credentials (a Home Assistant URL and Long-Lived Access Token, used solely to power snooze buttons on HA notifications).
+Routes Scrypted NVR's object-detection events to **Android TV overlays** and **phone push notifications** — with cropped thumbnails, snooze buttons, and tap-to-timeline deep links. Notifications are delivered through the native Scrypted SDK by default, with no third-party credentials required. Home Assistant and ntfy are both available as additional, fully optional notifiers. Home Assistant enabling lets you use HA-specific notification options (categories, icons, and a tap destination that opens Home Assistant's own Scrypted NVR timeline), and is the only case where this plugin stores Home Assistant credentials (a Home Assistant URL and Long-Lived Access Token, used solely to power snooze buttons on HA notifications). ntfy needs only a server URL and topic (and, optionally, an access token for a protected topic).
 
 [![npm version](https://img.shields.io/npm/v/@andygev35/smart-detection-relay.svg)](https://www.npmjs.com/package/@andygev35/smart-detection-relay)
 
@@ -13,6 +13,7 @@ Routes Scrypted NVR's object-detection events to **Android TV overlays** and **p
 - **TvOverlay installed and running on any Android/Google TV device(s)** you want overlays to appear on — only required if you use the TV overlay feature (it can be turned off entirely if you only want phone push). Install it from the [Google Play Store](https://play.google.com/store/apps/details?id=com.tabdeveloper.tvoverlay) on the TV itself; see the [TvOverlay GitHub repo](https://github.com/gugutab/TvOverlay) for its full REST API and setup docs.
 - **At least one Scrypted device implementing the `Notifier` interface**, for phone push — e.g. the native Scrypted app on your phone, linked via Scrypted Cloud. Only required if you use phone push (leave `Notify Services` empty if you only want TV overlays).
 - **Optional: Home Assistant**, if you want to use it as an additional notifier. Requires the [Scrypted Home Assistant plugin](https://github.com/scryptedapp/homeassistant) installed and configured (this syncs your HA `notify.` targets into Scrypted). For the "Home Assistant" tap destination and for snooze buttons on HA notifications, you'll also need a Scrypted Integration Token (from Home Assistant's own Scrypted custom component) and a Home Assistant URL + Long-Lived Access Token, respectively — see the Home Assistant Notifier section below. None of this is required if you only use the native Scrypted notifier.
+- **Optional: ntfy**, if you want to use it as an additional notifier. Just a Server URL and Topic (an [ntfy.sh](https://ntfy.sh) account isn't required — topics are created on the fly). If self-hosting, your server needs attachments enabled to receive thumbnails — see the ntfy Notifier section below.
 
 ## Setup
 
@@ -21,7 +22,7 @@ Routes Scrypted NVR's object-detection events to **Android TV overlays** and **p
 3. In that camera's tab, add a rule under **Rules**: type a name (e.g. "Frontyard Person") and press enter - it appears as a chip, and a settings section with that name appears below it.
 4. In that rule's section, pick a **Class Name** and **Zone** (zones populate automatically once the camera is selected), then set a **Score Threshold**. Optional filters (`Min Width/Height`, `Max X/Y`, `Fixed Crop`, `Critical Alert`) are available per rule.
 5. Repeat for each camera/rule you want. Remove a camera or rule at any time by removing its chip - this clears its settings. Each camera also has its own **Camera Enabled** switch, for turning detection off for just that camera without deleting its rules.
-6. Under the **Notifiers** tab, pick **Scrypted** for the native Scrypted app path (select which `Notifier` device(s) should receive phone push notifications), and/or **Home Assistant** for the optional HA path - see the Home Assistant Notifier section below for what that adds.
+6. Under the **Notifiers** tab, pick **Scrypted** for the native Scrypted app path (select which `Notifier` device(s) should receive phone push notifications), **Home Assistant** for the optional HA path (see the Home Assistant Notifier section below), and/or **ntfy** for the optional ntfy path (see the ntfy Notifier section below).
 7. Under the **TV Overlay** tab, enter the base URL(s) of your TvOverlay instance(s), comma-separated (e.g. `http://192.168.1.50:5001`).
 8. Adjust global options as needed — debounce, snooze durations (Android only, see below), bounding-box padding/crop ratio. Under the **Location** tab, Latitude/Longitude (used only for night-mode sunrise/sunset) are auto-detected from your server's public IP address on first install; use **Detect Location** to re-run that lookup anytime, or enter coordinates manually for more precision. **Clear Location** wipes both fields (night-mode-only cameras simply stop suppressing notifications until a location is set again).
 
@@ -38,11 +39,27 @@ Home Assistant is not required, but can be enabled as an additional notifier und
 
 None of these credentials are requested or stored unless you actually fill them in - the plugin works entirely without Home Assistant if you don't need it.
 
+## ntfy Notifier (optional)
+
+[ntfy](https://ntfy.sh) is not required, but can be enabled as an additional notifier under **Notifiers > ntfy**:
+
+- **Server URL** — `https://ntfy.sh` for the free public service, or your own self-hosted URL.
+- **Topic** — the ntfy topic to publish detections to. On a public server, anyone who knows the exact topic name can subscribe to it, so pick something hard to guess rather than something obvious.
+- **Access Token** (optional) — only needed for a protected topic or a self-hosted server with auth enabled.
+
+Notifications include the same cropped thumbnail, tap-to-timeline link, and snooze buttons as the other notifiers. Two things worth knowing:
+
+- **Self-hosted servers need attachments enabled to receive thumbnails.** If yours doesn't, notifications automatically fall back to text-only (title/tap/snooze still work) rather than failing outright — you'll see a warning in the log if this happens. To enable attachments, add `base-url` and `attachment-cache-dir` to your server's `server.yml` and restart the service. See [ntfy's attachments docs](https://docs.ntfy.sh/config/#attachments) for the full option list (size/expiry limits, etc.). On Windows, the config file defaults to `%ProgramData%\ntfy\server.yml`.
+- **Only one snooze button shows in the pushed notification itself.** ntfy's Android app reserves two of its three available button slots for its own built-in "Open"/"Browse" actions whenever a notification has both an attachment and a tap-through link — this is a known ntfy client limitation, not something this plugin can control (see [ntfy issue #1641](https://github.com/binwiederhier/ntfy/issues/1641)). All configured snooze durations are still available and working, though — they're just accessible from within the ntfy app's own notification list rather than the push itself. Tapping the notification's title/body opens the Scrypted timeline; tapping the thumbnail image opens ntfy's own image preview.
+
+Per-rule notification category/icon customization (available for Home Assistant) isn't offered for ntfy — testing found neither has any effect in the ntfy client.
+
 ## Features
 
 - **Chip-based settings UI** — add/remove cameras and rules as removable chips (the same pattern Scrypted's own built-in object detection settings use for zones); each addition reveals its own settings section automatically, no raw JSON editing.
 - **Organized settings tabs** — General, TV Overlay, Location, and Notifiers (with sub-tabs per notifier type) keep global options grouped by what they affect, instead of one long list.
 - **Optional Home Assistant notifier** — send to an HA `notify.` target alongside or instead of the native Scrypted app, with per-rule notification category/icon, a choice of tap destination (Scrypted app or Home Assistant's own NVR timeline), and working snooze buttons via a direct connection to HA's event stream. Entirely opt-in; no HA credentials are requested unless you configure it.
+- **Optional ntfy notifier** — send to any ntfy server (ntfy.sh or self-hosted) alongside the other notifiers, with the same thumbnail, tap-to-timeline, and snooze buttons. Just a server URL and topic; no account required.
 - **Per-camera enable/disable** — each camera has its own `Camera Enabled` switch, independent of the global `Plugin Enabled` switch, for turning off just one camera's detections temporarily without losing its configured rules.
 - **Smart thumbnail cropping** — crops are centered on the detected subject and fit to a configurable aspect ratio (square by default), always growing to fully contain the subject rather than cropping into it.
 - **Snooze buttons (Android only)** — configurable durations, delivered as native notification actions; tapping one suppresses further notifications for that camera/class. On iOS, the Scrypted app uses its own fixed, built-in snooze action instead of these custom buttons - see Notes below.
@@ -59,6 +76,7 @@ None of these credentials are requested or stored unless you actually fill them 
 - Plugin restarts reset in-memory debounce and snooze state.
 - **Snooze duration configuration only applies on Android.** The Scrypted iOS app doesn't render this plugin's custom snooze buttons at all - it substitutes its own fixed, built-in snooze action instead. Snoozing still works on iOS, but at whatever duration the Scrypted app itself hardcodes, not the `Snooze Durations` setting.
 - **Home Assistant credentials are opt-in.** The Scrypted Integration Token and Home Assistant URL/Long-Lived Access Token are only requested if you actually configure the Home Assistant Tap Destination or want HA snooze buttons - the plugin never asks for or stores them otherwise.
+- **ntfy attachments require server-side config.** A self-hosted ntfy server without `attachment-cache-dir` set will reject the thumbnail; notifications fall back to text-only automatically rather than failing. See the ntfy Notifier section above.
 
 ## Issues & Contributing
 

@@ -21,6 +21,20 @@ const HOMEASSISTANT_PLUGIN_ID = '@scrypted/homeassistant';
 // Snooze durations offered as notification action buttons.
 const ACTION_PREFIX = 'tvosnooze';
 
+// ntfy (https://ntfy.sh) emoji shortcode tags per detection class, shown as
+// icons in the ntfy client. Falls back to a generic camera icon for any
+// className not in this list (freeform class names are allowed elsewhere in
+// this plugin, e.g. custom detector classes).
+const NTFY_CLASS_TAGS: Record<string, string> = {
+    person: 'bust_in_silhouette',
+    vehicle: 'car',
+    animal: 'dog',
+    package: 'package',
+    face: 'slightly_smiling_face',
+    plate: '1234',
+};
+const NTFY_DEFAULT_TAG = 'movie_camera';
+
 interface ClassZoneRule {
     name?: string;        // optional friendly label, shown in settings and log lines
     className: string;
@@ -233,23 +247,31 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
                 this.startHomeAssistantEventListener();
             },
         },
-        // Placeholder only - not yet implemented. Reserved so the tab/field layout
-        // is already in place ahead of actually wiring up an ntfy send path.
+        // ntfy (https://ntfy.sh, or self-hosted) - a lightweight opt-in third
+        // notifier, independent of the Scrypted and Home Assistant paths above.
+        // Leaving Server URL or Topic blank disables it entirely.
         ntfyServerUrl: {
-            title: 'Server URL (not yet implemented)',
-            description: 'Placeholder for a future ntfy.sh (or self-hosted ntfy) notification path. Not yet functional - filling this in currently has no effect.',
+            title: 'Server URL',
+            description: 'Your ntfy server - e.g. https://ntfy.sh for the free public service, or your own self-hosted URL. Leave blank to disable ntfy notifications.',
             type: 'string',
             placeholder: 'e.g. https://ntfy.sh or your self-hosted URL',
             group: 'Notifiers',
-            subgroup: 'ntfy (Coming Soon)',
+            subgroup: 'ntfy',
         },
         ntfyTopic: {
-            title: 'Topic (not yet implemented)',
-            description: 'Placeholder for the ntfy topic to publish detections to. Not yet functional.',
+            title: 'Topic',
+            description: 'The ntfy topic to publish detections to. On a public server (like ntfy.sh) anyone who knows this exact topic name can subscribe to it, so use something hard to guess (or set an Access Token below) rather than something obvious.',
             type: 'string',
-            placeholder: 'e.g. smart-detection-relay',
+            placeholder: 'e.g. smart-detection-relay-a1b2c3',
             group: 'Notifiers',
-            subgroup: 'ntfy (Coming Soon)',
+            subgroup: 'ntfy',
+        },
+        ntfyAccessToken: {
+            title: 'Access Token (optional)',
+            description: 'Optional. Required only for a protected ntfy topic or a self-hosted server with auth enabled. Generate one in ntfy under Account > Access Tokens. Leave blank for a public/unauthenticated topic.',
+            type: 'password',
+            group: 'Notifiers',
+            subgroup: 'ntfy',
         },
         // Placeholder only - not yet implemented. Reserved so the tab/field layout
         // is already in place ahead of actually wiring up a Gotify send path.
@@ -1189,6 +1211,21 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
         return (this.settingsStorage.values.haAccessToken as string) || '';
     }
 
+    // ntfy notifier (see settings field definitions above). Trailing slashes on
+    // the server URL are stripped so it can be concatenated with the topic
+    // directly (`${ntfyServerUrl}/${ntfyTopic}`).
+    get ntfyServerUrl(): string {
+        return ((this.settingsStorage.values.ntfyServerUrl as string) || '').trim().replace(/\/+$/, '');
+    }
+
+    get ntfyTopic(): string {
+        return ((this.settingsStorage.values.ntfyTopic as string) || '').trim();
+    }
+
+    get ntfyAccessToken(): string {
+        return (this.settingsStorage.values.ntfyAccessToken as string) || '';
+    }
+
     get tvHosts(): string[] {
         const raw = (this.settingsStorage.values.tvHosts as string) || '';
         return raw.split(',').map(s => s.trim()).filter(Boolean);
@@ -1667,7 +1704,171 @@ class SmartDetectionRelayPlugin extends ScryptedDeviceBase implements Settings, 
             }
         })();
 
-        await Promise.all([nativeSendPromise, haSendPromise]);
+        // Sends to ntfy, if configured, in addition to the notifyServices and HA
+        // targets above - a third, fully independent notifier path (own try/catch,
+        // kicked off concurrently rather than chained after the others). ntfy has
+        // no NotifierOptions/Notifier-device concept at all; it's a plain HTTP
+        // publish to `${ntfyServerUrl}/${ntfyTopic}`, using ntfy's header-based
+        // publish format (https://docs.ntfy.sh/publish/) so a single request can
+        // carry the title/priority/tags/click-through/action-buttons AND the
+        // thumbnail image together - when the raw image bytes are the request
+        // body, the notification text itself moves to the `Message` header
+        // instead (there's no way to send both a text body and a binary
+        // attachment body in the same ntfy request).
+        const ntfySendPromise = (async () => {
+            if (!this.ntfyServerUrl || !this.ntfyTopic)
+                return;
+            try {
+                const ntfyUrl = `${this.ntfyServerUrl}/${encodeURIComponent(this.ntfyTopic)}`;
+                const bodyText = `${channel} Detected. Tap to view.`;
+
+                const headers: Record<string, string> = {
+                    // Non-ASCII-safe headers (Title/Tags/etc.) must be encoded per
+                    // ntfy's spec if they contain non-ASCII characters - camera/class
+                    // names in this plugin are expected to be plain ASCII in practice
+                    // (device names, detector class names), so no extra encoding here.
+                    'Title': `${cameraName} - ${channel} Detected`,
+                    'Priority': critical ? 'urgent' : 'default',
+                    'Tags': NTFY_CLASS_TAGS[className] ?? NTFY_DEFAULT_TAG,
+                    // Tapping the notification opens the same Scrypted NVR timeline
+                    // moment as the native app and HA paths above - reuses nvrWebUrl
+                    // rather than the native app's internal-only hash route, since
+                    // ntfy (like HA) needs an actual openable URL.
+                    //
+                    // Tried omitting this (7/20) on the theory that ntfy's
+                    // auto-inserted "Open" button (see the Actions comment below) was
+                    // tied to Click's presence, hoping to free a slot for more snooze
+                    // buttons. Confirmed live it made no difference - "Open" is tied
+                    // to the attachment itself, not Click - so there was no upside to
+                    // losing tap-to-open, and it's restored here.
+                    'Click': nvrWebUrl,
+                };
+                if (this.ntfyAccessToken)
+                    headers['Authorization'] = `Bearer ${this.ntfyAccessToken}`;
+
+                // Snooze buttons: ntfy's "http" action type lets a tap fire an
+                // arbitrary HTTP request directly from the client, no server-side
+                // ntfy support needed. Reuses this plugin's own webhook
+                // (getActionCallbackUrl()) and the exact same action identifiers
+                // already built for the native/HA paths above (buildSnoozeAction) -
+                // the webhook's existing `?action=` query-param fallback parser
+                // (see onRequest) already handles a plain GET with no body, so no
+                // new server-side parsing is needed for ntfy specifically. Snoozing
+                // is global (isSnoozed()/setSnoozed() don't care which notifier
+                // triggered it), so a tap here also silences the TV overlay and
+                // every other notifier, same as tapping a native/HA snooze button.
+                //
+                // ntfy caps notifications at 3 action buttons - unlike the native
+                // app and HA (which have no such limit and will happily render
+                // however many snoozeMinutes durations are configured), so this is
+                // sliced to the first 3 for ntfy specifically.
+                //
+                // actionUrl is NOT a bare endpoint - getActionCallbackUrl() prefers
+                // getPublicCloudEndpoint(), which already comes back with its own
+                // query string attached (a `?user_token=...` cloud auth token, often
+                // 500+ characters). Naively concatenating `?action=...` onto that
+                // produces a malformed URL with two `?`s - confirmed live 7/20, this
+                // is exactly what caused ntfy to reject an early test with HTTP 400.
+                // Using the URL API here instead correctly appends `action` as an
+                // additional `&`-joined param regardless of what's already on
+                // actionUrl.
+                let ntfyActionsHeader: string | undefined;
+                if (actionUrl && actions.length) {
+                    const ntfyActionParts: string[] = [];
+                    for (const a of actions.slice(0, 3)) {
+                        try {
+                            const u = new URL(actionUrl);
+                            u.searchParams.set('action', a.action);
+                            ntfyActionParts.push(`http, ${a.title}, ${u.toString()}, method=GET, clear=true`);
+                        }
+                        catch (e) {
+                            this.console.warn(`[${new Date().toLocaleTimeString()}]`, `[ntfy] Skipping snooze action "${a.title}" - could not build action URL`, e);
+                        }
+                    }
+                    if (ntfyActionParts.length)
+                        ntfyActionsHeader = ntfyActionParts.join('; ');
+                }
+                if (ntfyActionsHeader)
+                    headers['Actions'] = ntfyActionsHeader;
+
+                // POSTs to ntfy and returns a clean ok/status/detail result rather
+                // than throwing, so the three-tier fallback below (full send ->
+                // drop attachment -> drop actions) can inspect each failure and
+                // decide whether to degrade further, without try/catch nesting.
+                // `detail` is ntfy's own JSON error body (e.g. {"code":40014,
+                // "error":"attachments not allowed",...}) truncated defensively in
+                // case a misconfigured proxy returns an oversized HTML error page.
+                const postNtfy = async (h: Record<string, string>, b: string | Buffer) => {
+                    const r = await fetch(ntfyUrl, { method: 'POST', headers: h, body: b as any });
+                    if (r.ok)
+                        return { ok: true as const };
+                    const detail = (await r.text().catch(() => '')).slice(0, 500);
+                    return { ok: false as const, status: r.status, detail };
+                };
+
+                let curHeaders = headers;
+                let curBody: string | Buffer;
+                const hasAttachment = !!thumbnail?.buffer;
+                if (hasAttachment) {
+                    // Raw file bytes as the body - ntfy attaches them as an image and
+                    // renders a preview in the client. The notification text has to
+                    // move to the Message header in this mode, since the body is now
+                    // the attachment rather than the message.
+                    curHeaders = { ...headers, Filename: 'thumbnail.jpg', Message: bodyText };
+                    curBody = thumbnail!.buffer;
+                }
+                else {
+                    curBody = bodyText;
+                }
+
+                let attempt = await postNtfy(curHeaders, curBody);
+                let degraded = '';
+
+                // Confirmed live 7/20: a self-hosted ntfy server rejects attachment
+                // uploads entirely with "invalid request: attachments not allowed"
+                // (code 40014) unless attachment-cache-dir (and related limits) are
+                // configured server-side - see
+                // https://docs.ntfy.sh/config/#attachments. That's a server config
+                // question, not something this plugin can fix - but there's no
+                // reason to lose the whole notification over it. Retry once as a
+                // plain text-only publish (same title/priority/tags/click/actions,
+                // just no image), matching this plugin's existing pattern of
+                // degrading gracefully rather than failing outright (see the
+                // crop-to-full-frame fallback elsewhere).
+                if (!attempt.ok && hasAttachment) {
+                    this.console.warn(`[${new Date().toLocaleTimeString()}]`, `[ntfy] Attachment rejected by server (HTTP ${attempt.status}${attempt.detail ? `: ${attempt.detail}` : ''}) - retrying without the image. If this keeps happening, your ntfy server likely has attachments disabled; self-hosted servers need attachment-cache-dir configured (https://docs.ntfy.sh/config/#attachments).`);
+                    curHeaders = { ...headers };
+                    curBody = bodyText;
+                    attempt = await postNtfy(curHeaders, curBody);
+                    degraded = ' (text-only, no image - see warning above)';
+                }
+
+                // Separately, if the Actions header itself is what's rejected (e.g.
+                // a proxy/server with a tighter header-size limit than ntfy.sh's
+                // default - the real cloud webhook URLs here run ~700 characters
+                // each, so 3 of them is a couple KB), drop it and retry once more
+                // rather than losing the notification entirely. Snooze buttons just
+                // won't render on ntfy in that case; every other notifier is
+                // unaffected.
+                if (!attempt.ok && ntfyActionsHeader) {
+                    this.console.warn(`[${new Date().toLocaleTimeString()}]`, `[ntfy] Request rejected by server (HTTP ${attempt.status}${attempt.detail ? `: ${attempt.detail}` : ''}) - retrying without snooze action buttons.`);
+                    const { Actions, ...withoutActions } = curHeaders;
+                    curHeaders = withoutActions;
+                    attempt = await postNtfy(curHeaders, curBody);
+                    degraded += degraded ? ', no snooze buttons' : ' (no snooze buttons - see warning above)';
+                }
+
+                if (!attempt.ok)
+                    throw new Error(`ntfy returned HTTP ${attempt.status}${attempt.detail ? `: ${attempt.detail}` : ''}`);
+
+                this.console.log(`[${new Date().toLocaleTimeString()}]`, `[ntfy] Sent notification for ${cameraName} ${className} to topic ${this.ntfyTopic}${degraded}`);
+            }
+            catch (e) {
+                this.console.error(`[${new Date().toLocaleTimeString()}]`, `[ntfy] sendPhonePush failed`, e);
+            }
+        })();
+
+        await Promise.all([nativeSendPromise, haSendPromise, ntfySendPromise]);
     }
 
     // ---- TV overlay ----

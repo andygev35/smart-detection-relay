@@ -1,6 +1,9 @@
 <details>
 <summary>Changelog</summary>
 
+<h3>0.4.0</h3>
+<p>ntfy is now a fully supported notifier alongside the native Scrypted app and Home Assistant - optional, and off by default. Configure a Server URL and Topic under Notifiers > ntfy (an optional Access Token is also available for protected topics or self-hosted servers with auth enabled) to start receiving detections there too, with the same cropped thumbnail, tap-to-timeline link, and snooze buttons as the other notifiers. If your ntfy server doesn't have attachments enabled, notifications now fall back to text-only automatically instead of failing outright - see the README for the one-line server config needed to enable images on a self-hosted ntfy instance. Note: ntfy's own Android app only shows one snooze button in the pushed notification itself (its UI reserves two button slots for its own built-in "Open"/"Browse" actions whenever an image is attached), though all configured snooze durations are available and working from within the ntfy app's notification list. Per-rule notification category/icon customization (available for Home Assistant) isn't offered for ntfy - testing found neither has any effect in the ntfy client.</p>
+
 <h3>0.3.1</h3>
 <p>Fixed Home Assistant snooze buttons not working. The plugin was listening for the wrong iOS notification-action event name, and the connection to Home Assistant could silently stop reconnecting after a network hiccup or Home Assistant restart until the plugin itself was restarted. Both are fixed - snooze buttons on Home Assistant notifications should now work reliably, including recovering on their own after a brief Home Assistant outage.</p>
 
